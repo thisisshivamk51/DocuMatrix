@@ -1,40 +1,13 @@
 """
-Document Verification Platform - Fully Standalone Streamlit App
-No backend required - everything runs in the browser
+Document Verification Platform - Streamlit Frontend
 """
 import streamlit as st
-import sqlite3
-import hashlib
-import uuid
-import json
-import re
-from datetime import datetime
-from pathlib import Path
-import base64
-from io import BytesIO
+import requests
+import os
+import time
 
-# Optional imports with fallbacks
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
-
-try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-    # Initialize once
-    @st.cache_resource
-    def get_easyocr_reader():
-        return easyocr.Reader(['en', 'hi'], gpu=False)
-except ImportError:
-    EASYOCR_AVAILABLE = False
+# API configuration
+API_BASE = os.getenv("API_BASE", "http://localhost:8000/api/v1")
 
 # Page configuration
 st.set_page_config(
@@ -58,6 +31,17 @@ st.markdown("""
         background: #f8fafc;
     }
 
+    /* Glassmorphism Card Style */
+    .st-emotion-cache-1r6slb0, .card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        margin-bottom: 1.5rem;
+    }
+
+    /* Modern Buttons */
     .stButton > button {
         border-radius: 8px;
         font-weight: 600;
@@ -72,6 +56,7 @@ st.markdown("""
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
     }
 
+    /* Tabs Styling */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
         background-color: #f1f5f9;
@@ -94,6 +79,7 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0,0,0,0.05) !important;
     }
 
+    /* Custom Status Boxes */
     .status-done { 
         background: #ecfdf5; border-left: 4px solid #10b981; padding: 1rem; border-radius: 8px; color: #065f46; 
     }
@@ -109,6 +95,16 @@ st.markdown("""
         font-weight: 700 !important;
     }
 
+    /* HARD FIX: Hide internal Streamlit labels causing overlap */
+    [data-testid="stExpander"] button span {
+        display: none !important;
+    }
+    
+    .st-emotion-cache-1647y6o, .st-emotion-cache-p5m0v2, .st-emotion-cache-1053lbo {
+        overflow: hidden !important;
+    }
+
+    /* Sequential List Styling */
     .analysis-point {
         padding: 0.85rem 1.25rem;
         margin-bottom: 0.75rem;
@@ -127,491 +123,10 @@ st.markdown("""
         border: none;
         border-top: 1px solid #e2e8f0;
     }
-    
-    .info-box {
-        background: #f0f9ff;
-        border: 1px solid #0ea5e9;
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-# ============ DATABASE SETUP ============
-DB_PATH = "documents.db"
-
-def init_database():
-    """Initialize SQLite database"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS documents (
-            id TEXT PRIMARY KEY,
-            filename TEXT,
-            file_hash TEXT,
-            document_type TEXT,
-            ocr_text TEXT,
-            extracted_fields TEXT,
-            verification_status TEXT,
-            fraud_indicators TEXT,
-            confidence_score REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS verification_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_id TEXT,
-            action TEXT,
-            details TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (document_id) REFERENCES documents(id)
-        )
-    ''')
-    
-    # Create index for duplicate detection
-    cursor.execute('''
-        CREATE INDEX IF NOT EXISTS idx_file_hash ON documents(file_hash)
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-def get_db_connection():
-    """Get database connection"""
-    return sqlite3.connect(DB_PATH)
-
-def compute_file_hash(file_bytes):
-    """Compute SHA256 hash of file"""
-    return hashlib.sha256(file_bytes).hexdigest()
-
-def check_duplicate(file_hash):
-    """Check if document already exists"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, document_type, created_at FROM documents WHERE file_hash = ?", (file_hash,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
-
-def save_document(doc_id, filename, file_hash, doc_type, ocr_text, fields, status, fraud_indicators, confidence):
-    """Save document to database"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO documents 
-        (id, filename, file_hash, document_type, ocr_text, extracted_fields, 
-         verification_status, fraud_indicators, confidence_score, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (doc_id, filename, file_hash, doc_type, ocr_text, 
-          json.dumps(fields), status, json.dumps(fraud_indicators), 
-          confidence, datetime.now()))
-    conn.commit()
-    conn.close()
-
-def get_document(doc_id):
-    """Retrieve document by ID"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        return {
-            "id": result[0],
-            "filename": result[1],
-            "file_hash": result[2],
-            "document_type": result[3],
-            "ocr_text": result[4],
-            "extracted_fields": json.loads(result[5]) if result[5] else {},
-            "verification_status": result[6],
-            "fraud_indicators": json.loads(result[7]) if result[7] else [],
-            "confidence_score": result[8],
-            "created_at": result[9],
-            "updated_at": result[10]
-        }
-    return None
-
-def get_all_documents():
-    """Get all documents"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, document_type, verification_status, created_at FROM documents ORDER BY created_at DESC")
-    results = cursor.fetchall()
-    conn.close()
-    return results
-
-def update_document_fields(doc_id, fields):
-    """Update document fields"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE documents SET extracted_fields = ?, updated_at = ? WHERE id = ?
-    ''', (json.dumps(fields), datetime.now(), doc_id))
-    conn.commit()
-    conn.close()
-
-# Initialize database
-init_database()
-
-# ============ OCR FUNCTIONS ============
-
-def perform_ocr(image_bytes):
-    """Perform OCR on image"""
-    if not PIL_AVAILABLE:
-        return "Error: PIL/Pillow not installed. Install with: pip install Pillow"
-    
-    try:
-        image = Image.open(BytesIO(image_bytes))
-        
-        # Convert to RGB if necessary
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Try EasyOCR first (better for Indian documents)
-        if EASYOCR_AVAILABLE:
-            try:
-                reader = get_easyocr_reader()
-                results = reader.readtext(image_bytes)
-                text = "\n".join([result[1] for result in results])
-                if text.strip():
-                    return text
-            except Exception as e:
-                st.warning(f"EasyOCR failed: {e}, trying Tesseract...")
-        
-        # Fall back to Tesseract
-        if TESSERACT_AVAILABLE:
-            try:
-                text = pytesseract.image_to_string(image, lang='eng+hin')
-                if text.strip():
-                    return text
-            except Exception as e:
-                st.warning(f"Tesseract failed: {e}")
-        
-        # If no OCR engine available, return placeholder
-        return """[OCR Engine Not Available]
-
-To enable OCR, install one of:
-1. EasyOCR: pip install easyocr
-2. Tesseract: pip install pytesseract (and install Tesseract OCR)
-
-For Streamlit Cloud, add to requirements.txt:
-easyocr
-pytesseract
-
-Sample extracted text for demo:
-Name: JOHN DOE
-Date of Birth: 01/01/1990
-Document Number: ABCD1234567
-Address: 123 Main Street, City, State
-"""
-    except Exception as e:
-        return f"OCR Error: {str(e)}"
-
-# ============ DOCUMENT CLASSIFICATION ============
-
-DOCUMENT_PATTERNS = {
-    "pan_card": {
-        "keywords": ["permanent account number", "income tax department", "pan", "govt. of india"],
-        "patterns": [r"[A-Z]{5}[0-9]{4}[A-Z]"],  # PAN format
-        "fields": ["pan_number", "name", "father_name", "date_of_birth"]
-    },
-    "aadhaar_card": {
-        "keywords": ["aadhaar", "unique identification", "uidai", "आधार"],
-        "patterns": [r"\d{4}\s?\d{4}\s?\d{4}"],  # Aadhaar format
-        "fields": ["aadhaar_number", "name", "date_of_birth", "gender", "address"]
-    },
-    "driving_license": {
-        "keywords": ["driving", "license", "licence", "motor vehicle", "transport"],
-        "patterns": [r"[A-Z]{2}\d{2}\s?\d{11}"],  # DL format
-        "fields": ["license_number", "name", "date_of_birth", "validity", "address"]
-    },
-    "birth_certificate": {
-        "keywords": ["birth", "certificate", "registration", "born", "child"],
-        "patterns": [],
-        "fields": ["name", "date_of_birth", "place_of_birth", "father_name", "mother_name", "registration_number"]
-    },
-    "passport": {
-        "keywords": ["passport", "republic of india", "nationality", "travel document"],
-        "patterns": [r"[A-Z]\d{7}"],  # Passport format
-        "fields": ["passport_number", "name", "date_of_birth", "place_of_birth", "nationality", "expiry_date"]
-    },
-    "income_certificate": {
-        "keywords": ["income", "certificate", "annual income", "earnings"],
-        "patterns": [],
-        "fields": ["name", "income_amount", "financial_year", "issuing_authority"]
-    },
-    "caste_certificate": {
-        "keywords": ["caste", "certificate", "community", "sc", "st", "obc"],
-        "patterns": [],
-        "fields": ["name", "caste", "father_name", "address", "issuing_authority"]
-    },
-    "residence_certificate": {
-        "keywords": ["residence", "domicile", "residential", "proof of residence"],
-        "patterns": [],
-        "fields": ["name", "address", "duration", "issuing_authority"]
-    }
-}
-
-def classify_document(ocr_text):
-    """Classify document type based on OCR text"""
-    text_lower = ocr_text.lower()
-    scores = {}
-    
-    for doc_type, config in DOCUMENT_PATTERNS.items():
-        score = 0
-        
-        # Check keywords
-        for keyword in config["keywords"]:
-            if keyword in text_lower:
-                score += 10
-        
-        # Check patterns
-        for pattern in config["patterns"]:
-            if re.search(pattern, ocr_text, re.IGNORECASE):
-                score += 20
-        
-        scores[doc_type] = score
-    
-    # Get best match
-    if scores:
-        best_type = max(scores, key=scores.get)
-        if scores[best_type] > 0:
-            return best_type, scores[best_type] / 100
-    
-    return "unknown", 0.0
-
-# ============ FIELD EXTRACTION ============
-
-def extract_fields(ocr_text, document_type):
-    """Extract fields based on document type"""
-    fields = {}
-    
-    # Common patterns
-    patterns = {
-        "name": [
-            r"name[:\s]+([A-Z][a-zA-Z\s]+)",
-            r"नाम[:\s]+(.+)",
-        ],
-        "date_of_birth": [
-            r"(?:dob|date of birth|birth date|d\.o\.b)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-            r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
-        ],
-        "father_name": [
-            r"(?:father|father's name|s/o|d/o)[:\s]+([A-Z][a-zA-Z\s]+)",
-            r"पिता[:\s]+(.+)",
-        ],
-        "mother_name": [
-            r"(?:mother|mother's name)[:\s]+([A-Z][a-zA-Z\s]+)",
-            r"माता[:\s]+(.+)",
-        ],
-        "address": [
-            r"(?:address|addr)[:\s]+(.+?)(?:\n|$)",
-            r"पता[:\s]+(.+)",
-        ],
-        "pan_number": [
-            r"([A-Z]{5}[0-9]{4}[A-Z])",
-        ],
-        "aadhaar_number": [
-            r"(\d{4}\s?\d{4}\s?\d{4})",
-        ],
-        "license_number": [
-            r"([A-Z]{2}\d{2}\s?\d{11})",
-            r"(?:dl no|license no)[:\s]*([A-Z0-9]+)",
-        ],
-        "passport_number": [
-            r"([A-Z]\d{7})",
-        ],
-        "registration_number": [
-            r"(?:registration|reg\.? no)[:\s]*([A-Z0-9/-]+)",
-        ],
-        "gender": [
-            r"(?:gender|sex)[:\s]*(male|female|m|f)",
-            r"(पुरुष|महिला)",
-        ],
-        "validity": [
-            r"(?:valid|validity|expiry)[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        ],
-    }
-    
-    # Get expected fields for document type
-    expected_fields = DOCUMENT_PATTERNS.get(document_type, {}).get("fields", [])
-    
-    for field_name in expected_fields:
-        if field_name in patterns:
-            for pattern in patterns[field_name]:
-                match = re.search(pattern, ocr_text, re.IGNORECASE | re.MULTILINE)
-                if match:
-                    value = match.group(1).strip()
-                    fields[field_name] = {
-                        "value": value,
-                        "confidence": 0.8
-                    }
-                    break
-            
-            # If not found, add empty
-            if field_name not in fields:
-                fields[field_name] = {"value": "", "confidence": 0.0}
-    
-    return fields
-
-# ============ FRAUD DETECTION ============
-
-def detect_fraud_indicators(ocr_text, fields, image_bytes=None):
-    """Detect potential fraud indicators"""
-    indicators = []
-    confidence_score = 1.0
-    
-    # Check for suspicious patterns
-    suspicious_patterns = [
-        (r"sample|specimen|demo|test", "Contains sample/demo text"),
-        (r"photocopy|xerox|copy", "Appears to be a photocopy"),
-        (r"draft|provisional", "Document marked as draft/provisional"),
-    ]
-    
-    text_lower = ocr_text.lower()
-    
-    for pattern, message in suspicious_patterns:
-        if re.search(pattern, text_lower):
-            indicators.append(message)
-            confidence_score -= 0.1
-    
-    # Check field completeness
-    empty_fields = sum(1 for f in fields.values() if not f.get("value"))
-    total_fields = len(fields)
-    if total_fields > 0:
-        completeness = (total_fields - empty_fields) / total_fields
-        if completeness < 0.5:
-            indicators.append(f"Low field completeness: {completeness*100:.0f}%")
-            confidence_score -= 0.2
-    
-    # Check for low-quality OCR
-    if len(ocr_text) < 50:
-        indicators.append("Very little text extracted - possible low quality image")
-        confidence_score -= 0.3
-    
-    # Check for mixed scripts (potential tampering)
-    has_english = bool(re.search(r"[a-zA-Z]", ocr_text))
-    has_hindi = bool(re.search(r"[\u0900-\u097F]", ocr_text))
-    if has_english and has_hindi:
-        # This is normal for Indian documents, but flag excessive mixing
-        pass
-    
-    confidence_score = max(0.0, min(1.0, confidence_score))
-    
-    return indicators, confidence_score
-
-def determine_verification_status(confidence_score, fraud_indicators):
-    """Determine overall verification status"""
-    if confidence_score >= 0.8 and len(fraud_indicators) == 0:
-        return "VERIFIED"
-    elif confidence_score < 0.4 or len(fraud_indicators) >= 3:
-        return "REJECTED"
-    else:
-        return "NEEDS_REVIEW"
-
-# ============ SIGNATURE/SEAL DETECTION ============
-
-def detect_signatures_seals(image_bytes):
-    """Simple signature/seal detection"""
-    # This is a simplified version - real implementation would use CV
-    signatures = []
-    seals = []
-    
-    if PIL_AVAILABLE:
-        try:
-            image = Image.open(BytesIO(image_bytes))
-            width, height = image.size
-            
-            # Check bottom portion of document (common signature location)
-            # This is a heuristic - real detection would use ML
-            bottom_region = image.crop((0, int(height * 0.7), width, height))
-            
-            # Simple check: if bottom region has dark pixels, might have signature
-            if image.mode != 'L':
-                bottom_gray = bottom_region.convert('L')
-            else:
-                bottom_gray = bottom_region
-            
-            pixels = list(bottom_gray.getdata())
-            dark_pixels = sum(1 for p in pixels if p < 100)
-            total_pixels = len(pixels)
-            
-            if dark_pixels / total_pixels > 0.05:
-                signatures.append({"location": "bottom", "confidence": 0.6})
-            
-            # Check for circular patterns (seals)
-            # This is placeholder - real implementation would use Hough circles
-            
-        except Exception:
-            pass
-    
-    return {"signatures": signatures, "seals": seals}
-
-# ============ MAIN VERIFICATION FUNCTION ============
-
-def verify_document(image_bytes, filename):
-    """Main verification pipeline"""
-    doc_id = str(uuid.uuid4())
-    file_hash = compute_file_hash(image_bytes)
-    
-    # Check for duplicates
-    duplicate = check_duplicate(file_hash)
-    if duplicate:
-        return {
-            "status": "DUPLICATE",
-            "original_id": duplicate[0],
-            "original_filename": duplicate[1],
-            "original_type": duplicate[2],
-            "original_date": duplicate[3],
-            "message": "This document has already been verified"
-        }
-    
-    # Perform OCR
-    ocr_text = perform_ocr(image_bytes)
-    
-    # Classify document
-    doc_type, type_confidence = classify_document(ocr_text)
-    
-    # Extract fields
-    fields = extract_fields(ocr_text, doc_type)
-    
-    # Detect fraud indicators
-    fraud_indicators, confidence_score = detect_fraud_indicators(ocr_text, fields, image_bytes)
-    
-    # Determine status
-    verification_status = determine_verification_status(confidence_score, fraud_indicators)
-    
-    # Detect signatures/seals
-    sig_seal = detect_signatures_seals(image_bytes)
-    
-    # Save to database
-    save_document(
-        doc_id, filename, file_hash, doc_type, ocr_text,
-        fields, verification_status, fraud_indicators, confidence_score
-    )
-    
-    return {
-        "id": doc_id,
-        "status": "PROCESSED",
-        "document_type": doc_type,
-        "type_confidence": type_confidence,
-        "ocr_text": ocr_text,
-        "fields": fields,
-        "verification_status": verification_status,
-        "fraud_indicators": fraud_indicators,
-        "confidence_score": confidence_score,
-        "signatures": sig_seal
-    }
-
-# ============ UI COMPONENTS ============
-
-# Header
+# Centered Premium Header
 st.markdown("""
     <div style="text-align: center; margin-top: 1rem; margin-bottom: 3rem;">
         <h1 style="font-size: 4rem; font-weight: 900; margin-bottom: 0px; letter-spacing: -0.05em; color: #1e293b; line-height: 1;">
@@ -619,201 +134,308 @@ st.markdown("""
         </h1>
         <div style="height: 5px; width: 60px; background: linear-gradient(90deg, #0ea5e9, #2563eb); margin: 1.5rem auto; border-radius: 10px;"></div>
         <p style="color: #64748b; font-size: 1.25rem; font-weight: 400; max-width: 600px; margin: 0 auto;">
-            Standalone Document Verification • No Backend Required
+            Professional-grade forensic auditing and structural document intelligence.
         </p>
     </div>
 """, unsafe_allow_html=True)
 
-# System status
-ocr_status = "🟢 Available" if (EASYOCR_AVAILABLE or TESSERACT_AVAILABLE) else "🟡 Demo Mode"
-st.markdown(f"""
-    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 1rem;">
-        <span style="font-size: 0.85rem; color: #64748b; font-weight: 500;">OCR: {ocr_status}</span>
-    </div>
-""", unsafe_allow_html=True)
+# Check API connection
+def check_api():
+    try:
+        base_url = API_BASE.split('/api')[0]
+        resp = requests.get(f"{base_url}/health", timeout=2)
+        return resp.status_code == 200
+    except:
+        return False
+
+# API status indicator (Subtle)
+def get_api_status_html(status):
+    dot_color = "#10b981" if status else "#ef4444"
+    text = "System Online" if status else "System Offline"
+    return f"""
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 1rem;">
+            <div style="width: 8px; height: 8px; background-color: {dot_color}; border-radius: 50%;"></div>
+            <span style="font-size: 0.85rem; color: #64748b; font-weight: 500;">{text}</span>
+        </div>
+    """
+
+api_status = check_api()
+st.markdown(get_api_status_html(api_status), unsafe_allow_html=True)
 
 # Create tabs
-tabs = st.tabs(["📤 Upload & Verify", "📋 Verification History", "🔍 Document Lookup", "ℹ️ Info"])
+tabs = st.tabs(["📤 Upload & Verify", "📋 Job Status", "💬 RAG Chat", "ℹ️ Info"])
 
 # ============ Tab 1: Upload & Verify ============
 with tabs[0]:
     st.header("Upload Document")
-    st.markdown("Upload an image document for AI-powered verification.")
+    st.markdown("Upload an image or PDF document for AI-powered verification.")
     
     uploaded = st.file_uploader(
         "Choose a file",
-        type=["png", "jpg", "jpeg", "tiff", "bmp"],
-        help="Supported formats: PNG, JPG, JPEG, TIFF, BMP (max 10MB)"
+        type=["pdf", "png", "jpg", "jpeg", "tiff"],
+        help="Supported formats: PDF, PNG, JPG, JPEG, TIFF (max 50MB)"
     )
     
     if uploaded:
-        image_bytes = uploaded.read()
-        
         # Show file info
         col1, col2 = st.columns([2, 1])
         with col1:
-            st.info(f"📎 **File:** {uploaded.name} ({len(image_bytes) / 1024:.1f} KB)")
+            st.info(f"📎 **File:** {uploaded.name} ({uploaded.size / 1024:.1f} KB)")
         
-        # Show preview
-        with st.expander("👁️ Preview", expanded=True):
-            st.image(image_bytes, caption="Uploaded document", use_column_width=True)
+        # Show preview for images
+        if uploaded.type and uploaded.type.startswith("image"):
+            with st.expander("👁️ Preview", expanded=True):
+                st.image(uploaded, caption="Uploaded document", use_column_width=True)
         
         if st.button("🚀 Start Verification", type="primary", use_container_width=True):
-            with st.spinner("Processing document..."):
-                result = verify_document(image_bytes, uploaded.name)
-            
-            if result["status"] == "DUPLICATE":
-                st.warning(f"""
-                    ⚠️ **Duplicate Document Detected!**
-                    
-                    This document was already verified:
-                    - **Original ID:** `{result['original_id']}`
-                    - **Filename:** {result['original_filename']}
-                    - **Type:** {result['original_type']}
-                    - **Date:** {result['original_date']}
-                """)
+            if not api_status:
+                st.error("Cannot upload - backend API is not available")
             else:
-                # Store result in session for display
-                st.session_state.last_result = result
-                st.success(f"✅ Document processed! ID: `{result['id']}`")
-                st.rerun()
-    
-    # Display last result
-    if 'last_result' in st.session_state:
-        result = st.session_state.last_result
-        
-        # Status banner
-        v_status = result.get("verification_status", "UNKNOWN").upper()
-        status_styles = {
-            "VERIFIED": {"icon": "✅", "color": "#10b981", "bg": "#ecfdf5", "desc": "All authenticity checks passed."},
-            "REJECTED": {"icon": "❌", "color": "#ef4444", "bg": "#fef2f2", "desc": "Critical issues detected."},
-            "NEEDS_REVIEW": {"icon": "⚠️", "color": "#f59e0b", "bg": "#fffbeb", "desc": "Manual review required."},
-        }.get(v_status, {"icon": "❓", "color": "#64748b", "bg": "#f8fafc", "desc": "Processing complete."})
+                files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
+                
+                with st.spinner("Uploading and starting verification..."):
+                    try:
+                        resp = requests.post(f"{API_BASE}/upload", files=files, timeout=60)
+                        
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            st.success("✅ Verification job created!")
+                            st.code(data['job_id'], language=None)
+                            st.markdown("**Copy the Job ID above** and go to the **Job Status** tab to monitor progress.")
+                            
+                            # Store job ID in session
+                            if 'job_ids' not in st.session_state:
+                                st.session_state.job_ids = []
+                            if data['job_id'] not in st.session_state.job_ids:
+                                st.session_state.job_ids.insert(0, data['job_id'])
+                                st.session_state.job_ids = st.session_state.job_ids[:10]  # Keep last 10
+                        else:
+                            st.error(f"❌ Upload failed: {resp.text}")
+                    except requests.exceptions.Timeout:
+                        st.error("❌ Request timed out. The file may be too large.")
+                    except requests.exceptions.ConnectionError:
+                        st.error("❌ Cannot connect to backend. Make sure the API server is running.")
+                    except Exception as e:
+                        st.error(f"❌ Error: {str(e)}")
 
-        st.markdown(f"""
-            <div style="background-color: {status_styles['bg']}; border: 2px solid {status_styles['color']}; padding: 1.5rem; border-radius: 16px; text-align: center; margin: 2rem 0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                <div style="font-size: 3rem; margin-bottom: 0.5rem;">{status_styles['icon']}</div>
-                <div style="font-size: 2rem; font-weight: 800; color: {status_styles['color']}; text-transform: uppercase;">{v_status}</div>
-                <div style="font-size: 1rem; color: #475569; margin-top: 0.5rem;">{status_styles['desc']}</div>
-                <div style="font-size: 0.9rem; color: #64748b; margin-top: 0.5rem;">Document Type: <strong>{result.get('document_type', 'Unknown').replace('_', ' ').title()}</strong></div>
-                <div style="font-size: 0.9rem; color: #64748b;">Confidence: <strong>{result.get('confidence_score', 0)*100:.1f}%</strong></div>
-            </div>
-        """, unsafe_allow_html=True)
-        
-        # Tabs for details
-        detail_tabs = st.tabs(["📄 Extracted Fields", "🛡️ Security Analysis", "📝 Raw OCR"])
-        
-        with detail_tabs[0]:
-            fields = result.get("fields", {})
-            if fields:
-                for name, info in fields.items():
-                    value = info.get("value", "Not detected")
-                    conf = info.get("confidence", 0) * 100
-                    st.markdown(f"**{name.replace('_', ' ').title()}:** {value or 'Not detected'} ({conf:.0f}% confidence)")
-            else:
-                st.info("No fields extracted")
-        
-        with detail_tabs[1]:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                sigs = result.get("signatures", {})
-                sig_count = len(sigs.get("signatures", []))
-                if sig_count > 0:
-                    st.success(f"✅ {sig_count} Signature(s) detected")
-                else:
-                    st.warning("⚠️ No signature detected")
-            
-            with col2:
-                seal_count = len(sigs.get("seals", []))
-                if seal_count > 0:
-                    st.success(f"✅ {seal_count} Seal(s) detected")
-                else:
-                    st.info("ℹ️ No seal detected")
-            
-            # Fraud indicators
-            fraud = result.get("fraud_indicators", [])
-            if fraud:
-                st.markdown("#### ⚠️ Security Alerts")
-                for indicator in fraud:
-                    st.warning(f"🚩 {indicator}")
-            else:
-                st.success("✅ No security concerns detected")
-        
-        with detail_tabs[2]:
-            st.text_area("OCR Output", result.get("ocr_text", ""), height=300)
-        
-        # Clear result button
-        if st.button("🗑️ Clear Results"):
-            del st.session_state.last_result
-            st.rerun()
-
-# ============ Tab 2: History ============
+# ============ Tab 2: Job Status ============
 with tabs[1]:
-    st.header("Verification History")
+    st.header("Check Job Status")
     
-    documents = get_all_documents()
-    
-    if documents:
-        for doc in documents:
-            doc_id, filename, doc_type, status, created_at = doc
-            
-            status_icon = {"VERIFIED": "✅", "REJECTED": "❌", "NEEDS_REVIEW": "⚠️"}.get(status, "❓")
-            
-            with st.expander(f"{status_icon} {filename} - {doc_type or 'Unknown'}", expanded=False):
-                st.markdown(f"**ID:** `{doc_id}`")
-                st.markdown(f"**Type:** {doc_type or 'Unknown'}")
-                st.markdown(f"**Status:** {status}")
-                st.markdown(f"**Date:** {created_at}")
-                
-                if st.button("View Details", key=f"view_{doc_id}"):
-                    st.session_state.view_doc_id = doc_id
+    # Show recent jobs
+    if 'job_ids' in st.session_state and st.session_state.job_ids:
+        st.markdown("**Recent Jobs:**")
+        selected_job = st.selectbox("Select a job", st.session_state.job_ids, key="job_select")
     else:
-        st.info("No documents verified yet. Upload a document to get started!")
-
-# ============ Tab 3: Document Lookup ============
-with tabs[2]:
-    st.header("Document Lookup")
+        selected_job = None
     
-    doc_id = st.text_input("Enter Document ID:")
+    job_id = st.text_input("Or enter Job ID manually:", value=selected_job or "", key="job_input")
     
-    if st.button("🔍 Lookup", use_container_width=True):
-        if doc_id:
-            doc = get_document(doc_id)
-            if doc:
-                st.success("Document found!")
+    col1, col2 = st.columns(2)
+    with col1:
+        check_btn = st.button("🔍 Check Status", use_container_width=True)
+    with col2:
+        auto_refresh = st.checkbox("Auto-refresh (5s)")
+    
+    if check_btn or (auto_refresh and job_id):
+        if job_id:
+            try:
+                resp = requests.get(f"{API_BASE}/status/{job_id}", timeout=10)
                 
-                st.json({
-                    "id": doc["id"],
-                    "filename": doc["filename"],
-                    "document_type": doc["document_type"],
-                    "verification_status": doc["verification_status"],
-                    "confidence_score": doc["confidence_score"],
-                    "extracted_fields": doc["extracted_fields"],
-                    "fraud_indicators": doc["fraud_indicators"],
-                    "created_at": doc["created_at"]
-                })
-                
-                # Field correction form
-                st.markdown("### ✏️ Update Fields")
-                with st.form("update_fields"):
-                    updated_fields = {}
-                    for name, info in doc["extracted_fields"].items():
-                        new_val = st.text_input(
-                            name.replace('_', ' ').title(),
-                            value=info.get("value", ""),
-                            key=f"field_{name}"
-                        )
-                        updated_fields[name] = {"value": new_val, "confidence": 1.0}
+                if resp.status_code == 200:
+                    data = resp.json()
                     
-                    if st.form_submit_button("Save Changes"):
-                        update_document_fields(doc_id, updated_fields)
-                        st.success("✅ Fields updated!")
+                    # Status indicator
+                    status = data.get("status", "unknown")
+                    status_icons = {
+                        "done": "✅",
+                        "error": "❌", 
+                        "processing": "⏳",
+                        "queued": "📋"
+                    }
+                    icon = status_icons.get(status, "❓")
+                    
+                    st.markdown(f"### {icon} Status: {status.upper()}")
+                    
+                    # Auto-refresh for processing jobs
+                    if status == "processing" and auto_refresh:
+                        time.sleep(5)
                         st.rerun()
-            else:
-                st.error("Document not found")
+                    
+                    # Show results
+                    result = data.get("result")
+                    if result:
+                        if "error" in result:
+                            st.error(f"**Error:** {result['error']}")
+                            if "traceback" in result:
+                                with st.expander("Error Details"):
+                                    st.code(result['traceback'])
+                        else:
+                            # --- POLISHED CLEAR STRUCTURAL REPORT (V2) ---
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                            # 1. PRIMARY DECISION BANNER
+                            v_status = result.get("verification_summary", {}).get("overall_status", "UNKNOWN").upper()
+                            status_styles = {
+                                "VERIFIED": {"icon": "✅", "color": "#10b981", "bg": "#ecfdf5", "desc": "Verification Successful: All authenticity checks passed."},
+                                "REJECTED": {"icon": "❌", "color": "#ef4444", "bg": "#fef2f2", "desc": "Verification Failed: Critical security discrepancies detected."},
+                                "NEEDS_REVIEW": {"icon": "⚠️", "color": "#f59e0b", "bg": "#fffbeb", "desc": "Manual Review Required: Some checks were inconclusive."},
+                                "APPROVED": {"icon": "✅", "color": "#10b981", "bg": "#ecfdf5", "desc": "Manually Approved by Administrator."}
+                            }.get(v_status, {"icon": "❓", "color": "#64748b", "bg": "#f8fafc", "desc": "Processing Complete."})
+
+                            st.markdown(f"""
+                                <div style="background-color: {status_styles['bg']}; border: 2px solid {status_styles['color']}; padding: 1.5rem; border-radius: 16px; text-align: center; margin-bottom: 2rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+                                    <div style="font-size: 3rem; margin-bottom: 0.5rem;">{status_styles['icon']}</div>
+                                    <div style="font-size: 2rem; font-weight: 800; color: {status_styles['color']}; text-transform: uppercase; letter-spacing: 0.05em;">{v_status}</div>
+                                    <div style="font-size: 1.1rem; color: #475569; margin-top: 0.5rem; font-weight: 500;">{status_styles['desc']}</div>
+                                </div>
+                            """, unsafe_allow_html=True)
+
+                            # 3. DETAILED EVIDENCE
+                            tab_data, tab_security = st.tabs(["📄 Extracted Information", "🛡️ Forensic Details"])
+
+                            with tab_data:
+                                fields = result.get("fields", {})
+                                if fields:
+                                    # Presentation-grade table
+                                    table_data = []
+                                    for name, info in fields.items():
+                                        table_data.append({
+                                            "Field": name.replace('_', ' ').title(),
+                                            "Value": info.get("value", "N/A"),
+                                            "Confidence": f"{info.get('confidence', 0)*100:.1f}%"
+                                        })
+                                    st.table(table_data)
+                                else:
+                                    st.warning("⚠️ No structured fields were extracted. This usually occurs if the image text is not legible.")
+
+                            with tab_security:
+                                scol1, scol2 = st.columns(2)
+                                sigs = result.get("signatures", {})
+                                
+                                with scol1:
+                                    st.write("**Human Verification**")
+                                    sig_count = len(sigs.get('signatures', []))
+                                    if sig_count > 0:
+                                        st.success(f"✅ Found {sig_count} Signature(s)")
+                                    else:
+                                        st.error("❌ No Signatures Detected")
+                                
+                                with scol2:
+                                    st.write("**Institutional Verification**")
+                                    seal_count = len(sigs.get('seals', []))
+                                    if seal_count > 0:
+                                        st.success("✅ Seal/Stamp Verified")
+                                    else:
+                                        st.info("ℹ️ No Seal/Stamp Detected")
+
+                                # Security Alerts
+                                fraud_indicators = result.get("fraud", {}).get("fraud_indicators", [])
+                                if fraud_indicators:
+                                    st.markdown("#### Security Indicators")
+                                    for indicator in list(set(fraud_indicators)):
+                                        st.warning(f"🚩 {indicator}")
+
+                            # 4. AI NOTES (SEQUENTIAL & PRESENTABLE)
+                            st.markdown("### 🤖 Forensic Intelligence Report")
+                            analysis_summary = result.get("analysis_notes") or result.get("verification_summary", {}).get("analysis_summary")
+                            if analysis_summary:
+                                points = analysis_summary.split("\n")
+                                for pt in points:
+                                    content = pt.strip()
+                                    if content:
+                                        # Use a clean, sequential block for each point
+                                        st.markdown(f'<div class="analysis-point">{content}</div>', unsafe_allow_html=True)
+                            else:
+                                st.info("Manual review recommended. Automated analysis could not reach a high confidence conclusion.")
+
+                            # 5. TECHNICAL UTILITIES
+                            with st.expander("🛠️ Advanced Inspection Tools"):
+                                utab1, utab2 = st.tabs(["OCR Raw Text", "System JSON"])
+                                utab1.text(result.get("ocr_text", ""))
+                                utab2.json(result)
+
+                            # 6. QUICK CORRECTIONS
+                            st.markdown("---")
+                            st.markdown("### ✏️ Correction Console")
+                            with st.form("corrections_v3"):
+                                c_cols = st.columns(2)
+                                overrides = {}
+                                for i, field_name in enumerate(fields.keys()):
+                                    with c_cols[i % 2]:
+                                        current = fields[field_name].get("value") or ""
+                                        new_val = st.text_input(f"{field_name.replace('_', ' ').title()}", value=current)
+                                        if new_val != current:
+                                            overrides[field_name] = new_val
+                                if st.form_submit_button("Submit Corrections", use_container_width=True, type="primary"):
+                                    if overrides:
+                                        try:
+                                            r = requests.post(f"{API_BASE}/correct/{job_id}", json={"overrides": overrides}, timeout=10)
+                                            if r.status_code == 200:
+                                                st.success("✅ Updated! Reloding...")
+                                                time.sleep(1)
+                                                st.rerun()
+                                            else:
+                                                st.error(f"Save failed: {r.text}")
+                                        except Exception as e:
+                                            st.error(f"Error: {str(e)}")
+                    elif status == "processing":
+                        st.info("⏳ Document is being processed... Please wait.")
+                    elif status == "queued":
+                        st.info("📋 Job is queued and will start processing soon.")
+                else:
+                    st.error(f"❌ Job not found: {job_id}")
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Cannot connect to backend.")
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
         else:
-            st.warning("Please enter a document ID")
+            st.warning("Please enter or select a Job ID")
+
+# ============ Tab 3: RAG Chat ============
+with tabs[2]:
+    st.header("💬 Document Assistant")
+    st.markdown("Ask questions about verified documents or document templates.")
+    
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask about documents..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Get response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    resp = requests.post(f"{API_BASE}/chat", json={"query": prompt}, timeout=60)
+                    if resp.status_code == 200:
+                        answer = resp.json().get("answer", "No response")
+                        st.markdown(answer)
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                    else:
+                        error_msg = f"Error: {resp.text}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                except requests.exceptions.ConnectionError:
+                    st.error("❌ Cannot connect to backend.")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+    
+    # Clear chat button
+    if st.session_state.messages:
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
 
 # ============ Tab 4: Info ============
 with tabs[3]:
@@ -821,70 +443,41 @@ with tabs[3]:
     
     st.markdown("""
     ### About
-    This is a **fully standalone** document verification platform that runs entirely in your browser.
-    
-    **No backend server required!** Everything runs locally:
-    - ✅ OCR processing
-    - ✅ Document classification
-    - ✅ Field extraction
-    - ✅ Fraud detection
-    - ✅ SQLite database
+    This is an AI-powered Document Verification Platform that can:
+    - **OCR**: Extract text from document images
+    - **Classify**: Identify document types (birth certificate, ID card, etc.)
+    - **Extract**: Pull out key fields (name, date, ID numbers)
+    - **Verify**: Check for duplicates and potential fraud
+    - **Chat**: Answer questions using RAG (Retrieval Augmented Generation)
     
     ### Supported Document Types
-    - PAN Card
-    - Aadhaar Card
-    - Driving License
     - Birth Certificate
+    - ID Card (Aadhaar)
+    - Driving License
+    - PAN Card
     - Passport
+    - Affidavit
     - Income Certificate
-    - Caste Certificate
     - Residence Certificate
+    - Caste Certificate
     
-    ### OCR Engines
-    """)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("EasyOCR", "✅ Available" if EASYOCR_AVAILABLE else "❌ Not Installed")
-    with col2:
-        st.metric("Tesseract", "✅ Available" if TESSERACT_AVAILABLE else "❌ Not Installed")
-    
-    st.markdown("""
-    ### Installation (for full OCR support)
-    
-    ```bash
-    pip install easyocr pillow
-    # or
-    pip install pytesseract pillow
-    ```
-    
-    For Streamlit Cloud, add to `requirements.txt`:
-    ```
-    streamlit
-    pillow
-    easyocr
-    ```
+    ### API Endpoints
+    | Endpoint | Method | Description |
+    |----------|--------|-------------|
+    | `/api/upload` | POST | Upload document |
+    | `/api/status/{id}` | GET | Check job status |
+    | `/api/correct/{id}` | POST | Submit corrections |
+    | `/api/chat` | POST | RAG chatbot query |
     """)
     
     st.divider()
     
-    # Database stats
-    st.markdown("### Database Statistics")
-    docs = get_all_documents()
-    col1, col2, col3 = st.columns(3)
+    st.markdown("### System Status")
+    col1, col2 = st.columns(2)
     with col1:
-        st.metric("Total Documents", len(docs))
+        st.metric("API Status", "🟢 Online" if api_status else "🔴 Offline")
     with col2:
-        verified = sum(1 for d in docs if d[3] == "VERIFIED")
-        st.metric("Verified", verified)
-    with col3:
-        rejected = sum(1 for d in docs if d[3] == "REJECTED")
-        st.metric("Rejected", rejected)
+        st.metric("API URL", API_BASE)
 
 # Footer
 st.divider()
-st.markdown("""
-    <div style="text-align: center; color: #64748b; font-size: 0.85rem;">
-        DocuMatrix • Standalone Document Verification • No Backend Required
-    </div>
-""", unsafe_allow_html=True)
