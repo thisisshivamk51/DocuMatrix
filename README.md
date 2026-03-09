@@ -96,3 +96,7 @@ Lightweight, governance-oriented document verification demo:
 - **Security**: Add authentication, RBAC, HTTPS, encryption at rest, and secrets manager.
 - **LLM**: The generator is a placeholder. Replace with your LLM API in `backend/app/services/rag.py`.
 
+
+Kindly review the project workflow for the AI-powered documentation platform featured in the video .
+
+
