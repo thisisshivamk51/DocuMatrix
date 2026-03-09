@@ -86,7 +86,13 @@ Lightweight, governance-oriented document verification demo:
 
 ## Notes & TODOs
 
+
+
+
+
+
 - **OCR**: Tesseract is used; for better regional accuracy, integrate commercial OCR or fine-tune models.
 - **Scaling**: BackgroundTasks are fine for demo. For production, use Celery/RQ with Redis.
 - **Security**: Add authentication, RBAC, HTTPS, encryption at rest, and secrets manager.
 - **LLM**: The generator is a placeholder. Replace with your LLM API in `backend/app/services/rag.py`.
+
